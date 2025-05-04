@@ -1,0 +1,13 @@
+train: C:\Users\Ahmed\Desktop\coding\Versions\grad i\deep_sort\human-detection\train\images
+val: C:\Users\Ahmed\Desktop\coding\Versions\grad i\deep_sort\human-detection\valid\images
+test: C:\Users\Ahmed\Desktop\coding\Versions\grad i\deep_sort\human-detection\test\images
+
+nc: 1
+names: ['person']
+
+roboflow:
+  workspace: mot20
+  project: train_dataset-vfnm3
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/mot20/train_dataset-vfnm3/dataset/1

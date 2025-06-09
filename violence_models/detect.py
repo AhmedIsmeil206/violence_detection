@@ -9,6 +9,7 @@ from deep_sort import nn_matching
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 from violence_models.pose_estimation.pose_processor import PoseProcessor
+from violence_models.pose_estimation.ucf_crime_pose_processor import UCFCrimePoseProcessor
 from collections import deque
 import os
 
@@ -223,57 +224,278 @@ class ViolenceTypeDetector:
         
         # Load YOLO model for violence type detection
         self.model = YOLO(model_path)
-        self.class_names = ['grenade', 'handgun', 'knife', 'theft mask']
-        self.type_threshold = 0.35  # Default threshold for violence type detection
+        self.class_names = ['grenade', 'handgun', 'knife', 'theft mask']          # Enhanced class-specific thresholds for better confidence
+        self.class_thresholds = {
+            0: 0.65,  # grenade - significantly increased threshold to reduce false positives
+            1: 0.30,  # handgun - medium threshold
+            2: 0.25,  # knife - lower threshold, can be small and hard to detect
+            3: 0.80   # theft mask - very high threshold to prevent false detections
+        }
+        
+        # Size validation constraints per class
+        self.size_constraints = {
+            'grenade': {'min_area_ratio': 0.0001, 'max_area_ratio': 0.02, 'aspect_ratio_range': (0.7, 1.4)},
+            'handgun': {'min_area_ratio': 0.0001, 'max_area_ratio': 0.08, 'aspect_ratio_range': (1.2, 3.5)},
+            'knife': {'min_area_ratio': 0.00005, 'max_area_ratio': 0.05, 'aspect_ratio_range': (2.0, 10.0)},
+            'theft mask': {'min_area_ratio': 0.0005, 'max_area_ratio': 0.15, 'aspect_ratio_range': (0.8, 1.3)}
+        }
+        
+        # Temporal consistency tracking
+        from collections import deque
+        self.detection_history = deque(maxlen=5)
+        self.stable_detections = {}
+        
+        self.type_threshold = 0.30  # Default threshold for violence type detection
+
+    def _validate_detection_size(self, box, class_id, frame_shape):
+        """Validate detection based on expected size constraints"""
+        x1, y1, x2, y2 = box[:4]
+        width = x2 - x1
+        height = y2 - y1
+        area = width * height
+        frame_area = frame_shape[0] * frame_shape[1]
+        area_ratio = area / frame_area
+        aspect_ratio = width / max(height, 1)
+        
+        class_name = self.class_names[class_id]
+        constraints = self.size_constraints.get(class_name, {})
+        
+        # Check area constraints
+        min_area = constraints.get('min_area_ratio', 0.00001)
+        max_area = constraints.get('max_area_ratio', 0.5)
+        
+        if not (min_area <= area_ratio <= max_area):
+            return False
+        
+        # Check aspect ratio constraints
+        aspect_range = constraints.get('aspect_ratio_range', (0.1, 20.0))
+        if not (aspect_range[0] <= aspect_ratio <= aspect_range[1]):
+            return False
+        
+        return True
     
+    def _adjust_confidence_by_context(self, detection, frame):
+        """Adjust confidence based on contextual factors"""
+        x1, y1, x2, y2, conf, class_id = detection[:6]
+        class_name = self.class_names[class_id]
+        
+        # Size-based adjustment
+        width = x2 - x1
+        height = y2 - y1
+        area = width * height
+        frame_area = frame.shape[0] * frame.shape[1]
+        area_ratio = area / frame_area
+        
+        size_multiplier = 1.0
+        if area_ratio < 0.001:  # Very small objects
+            size_multiplier = 0.85  # Slightly reduce confidence
+        elif area_ratio > 0.05:  # Large objects
+            size_multiplier = 1.1  # Increase confidence
+        
+        # Class-specific adjustments
+        class_multiplier = 1.0
+        aspect_ratio = width / max(height, 1)
+        
+        if class_name == 'knife' and 2.0 <= aspect_ratio <= 8.0:
+            class_multiplier = 1.15  # Good knife aspect ratio
+        elif class_name == 'handgun' and 1.2 <= aspect_ratio <= 3.0:
+            class_multiplier = 1.2   # Good handgun aspect ratio
+        elif class_name == 'grenade' and 0.8 <= aspect_ratio <= 1.3:
+            class_multiplier = 1.1   # Round objects are likely grenades
+        elif class_name == 'theft mask' and y1 < frame.shape[0] * 0.4:
+            class_multiplier = 1.15  # Masks are typically on upper part of frame
+        
+        # Lighting-based adjustment
+        roi = frame[max(0, y1):min(frame.shape[0], y2), max(0, x1):min(frame.shape[1], x2)]
+        if roi.size > 0:
+            brightness = np.mean(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY))
+            if brightness < 60:  # Dark regions
+                class_multiplier *= 0.9
+            elif 80 <= brightness <= 180:  # Good lighting
+                class_multiplier *= 1.05
+        
+        # Apply all adjustments
+        adjusted_conf = conf * size_multiplier * class_multiplier
+        return min(adjusted_conf, 0.98)  # Cap at 98%
+    
+    def _temporal_consistency_check(self, detections, frame_time):
+        """Apply temporal consistency filtering"""
+        current_frame_detections = {}
+        
+        for detection in detections:
+            x1, y1, x2, y2, conf, class_id = detection[:6]
+            
+            # Create detection key based on location and class
+            center_x = (x1 + x2) / 2
+            center_y = (y1 + y2) / 2
+            det_key = f"{class_id}_{int(center_x/30)}_{int(center_y/30)}"
+            
+            current_frame_detections[det_key] = {
+                'detection': detection,
+                'timestamp': frame_time,
+                'center': (center_x, center_y)
+            }
+        
+        # Add to history
+        self.detection_history.append(current_frame_detections)
+        
+        # Find stable detections (appeared in multiple recent frames)
+        stable_detections = []
+        min_appearances = 2  # Require at least 2 frames
+        
+        for det_key, current_det in current_frame_detections.items():
+            appearances = 1  # Current frame
+            total_confidence = current_det['detection'][4]
+            
+            # Check recent history
+            for hist_frame in list(self.detection_history)[:-1]:
+                if det_key in hist_frame:
+                    appearances += 1
+                    total_confidence += hist_frame[det_key]['detection'][4]
+            
+            # If stable enough, add to results with averaged confidence
+            if appearances >= min_appearances:
+                avg_confidence = total_confidence / appearances
+                detection = current_det['detection'].copy()
+                detection[4] = avg_confidence * 1.1  # Boost for stability
+                stable_detections.append(detection)
+            elif current_det['detection'][4] > 0.7:  # Very high confidence single detection
+                stable_detections.append(current_det['detection'])
+        
+        return stable_detections
+
     def detect_violence_type(self, frame, conf_threshold=None):
         """
-        Detect violence type in a frame using YOLO model.
+        Enhanced violence type detection with improved confidence filtering
         Args:
             frame: Input image
-            conf_threshold: Optional confidence threshold override (default: self.type_threshold)
+            conf_threshold: Optional confidence threshold override
         Returns: 
             list of [x1, y1, x2, y2, confidence, class_id] for each detection
         """
         try:
-            # Use provided threshold or default
-            threshold = conf_threshold if conf_threshold is not None else self.type_threshold
+            import time
+            frame_time = time.time()
             
-            # Run inference with YOLO model
-            results = self.model(frame, imgsz=1280, verbose=False)[0]
+            # Multi-scale detection for better small object detection
             detections = []
             
-            if results.boxes is not None and len(results.boxes) > 0:
-                boxes = results.boxes.data
-                for box in boxes:
-                    # Get box coordinates, confidence and class
-                    x1, y1, x2, y2, conf, cls = box.cpu().numpy()
-                    class_id = int(cls)
-                    
-                    # Apply filtering for false positives
-                    obj_width = x2 - x1
-                    obj_height = y2 - y1
-                    obj_area = obj_width * obj_height
-                    frame_area = frame.shape[0] * frame.shape[1]
-                    area_ratio = obj_area / frame_area
-                    
-                    # Filter out very small or very large detections
-                    if area_ratio < 0.0005 or area_ratio > 0.5:
-                        continue
-                    
-                    # Only include detections above threshold
-                    if conf > threshold:
-                        detections.append([
-                            int(x1), int(y1), int(x2), int(y2),
-                            float(conf),
-                            class_id
-                        ])
+            # Standard scale detection
+            results = self.model(frame, imgsz=1280, verbose=False)[0]
+            standard_detections = self._process_results(results, frame, scale_factor=1.0)
+            detections.extend(standard_detections)
             
-            return detections
+            # Large scale for small objects (1.25x)
+            height, width = frame.shape[:2]
+            large_frame = cv2.resize(frame, (int(width*1.25), int(height*1.25)), interpolation=cv2.INTER_CUBIC)
+            results_large = self.model(large_frame, imgsz=1280, verbose=False)[0]
+            large_detections = self._process_results(results_large, large_frame, scale_factor=1/1.25)
+            detections.extend(large_detections)
+            
+            # Apply Non-Maximum Suppression to remove duplicates
+            detections = self._apply_nms(detections)
+            
+            # Filter and validate detections
+            validated_detections = []
+            for detection in detections:
+                x1, y1, x2, y2, conf, class_id = detection[:6]
+                
+                # Size validation
+                if not self._validate_detection_size(detection, class_id, frame.shape):
+                    continue
+                
+                # Context-based confidence adjustment
+                adjusted_conf = self._adjust_confidence_by_context(detection, frame)
+                detection[4] = adjusted_conf
+                
+                # Apply class-specific threshold
+                threshold = conf_threshold if conf_threshold else self.class_thresholds.get(class_id, 0.3)
+                if adjusted_conf > threshold:
+                    validated_detections.append(detection[:6])
+            
+            # Apply temporal consistency check
+            stable_detections = self._temporal_consistency_check(validated_detections, frame_time)
+            
+            return stable_detections
             
         except Exception as e:
-            logger.error(f"Error in violence type detection: {str(e)}")
+            logger.error(f"Error in enhanced violence type detection: {str(e)}")
             return []
+    
+    def _process_results(self, results, frame, scale_factor=1.0):
+        """Process YOLO results with scale adjustment"""
+        detections = []
+        
+        if results.boxes is not None and len(results.boxes) > 0:
+            boxes = results.boxes.data.cpu().numpy()
+            for box in boxes:
+                x1, y1, x2, y2, conf, cls = box
+                class_id = int(cls)
+                
+                # Scale coordinates back if needed
+                if scale_factor != 1.0:
+                    x1, y1, x2, y2 = [coord * scale_factor for coord in [x1, y1, x2, y2]]
+                
+                # Apply basic threshold
+                if conf > 0.15:  # Very low threshold for initial filtering
+                    detections.append([
+                        int(x1), int(y1), int(x2), int(y2),
+                        float(conf), class_id
+                    ])
+        
+        return detections
+    
+    def _apply_nms(self, detections, iou_threshold=0.5):
+        """Apply Non-Maximum Suppression"""
+        if not detections:
+            return []
+        
+        # Group by class
+        from collections import defaultdict
+        class_detections = defaultdict(list)
+        for det in detections:
+            class_detections[det[5]].append(det)
+        
+        final_detections = []
+        
+        for class_id, class_dets in class_detections.items():
+            if not class_dets:
+                continue
+                
+            # Sort by confidence
+            class_dets.sort(key=lambda x: x[4], reverse=True)
+            
+            # Apply NMS for this class
+            keep = []
+            while class_dets:
+                best = class_dets.pop(0)
+                keep.append(best)
+                
+                remaining = []
+                for det in class_dets:
+                    iou = self._calculate_iou(best[:4], det[:4])
+                    if iou < iou_threshold:
+                        remaining.append(det)
+                
+                class_dets = remaining
+            
+            final_detections.extend(keep)
+        
+        return final_detections
+    
+    def _calculate_iou(self, box1, box2):
+        """Calculate Intersection over Union"""
+        x1 = max(box1[0], box2[0])
+        y1 = max(box1[1], box2[1])
+        x2 = min(box1[2], box2[2])
+        y2 = min(box1[3], box2[3])
+        
+        intersection = max(0, x2 - x1) * max(0, y2 - y1)
+        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        union = area1 + area2 - intersection
+        
+        return intersection / union if union > 0 else 0
 
 def process_sequence(sequence_path, model_paths=None, output_dir='results/videos'):
     """Process a MOT17 sequence for violence detection.
@@ -369,3 +591,237 @@ def process_mot17_test(mot17_dir, output_dir='results/videos'):
         process_sequence(seq_path, output_dir=output_dir)
         
     logger.info("Completed processing all MOT17 test sequences")
+
+class UCFCrimeViolenceDetector:
+    """Enhanced Violence Detector supporting UCF-Crime multi-class detection"""
+    
+    def __init__(self, model_paths=None, enable_pose_validation=True):
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        if model_paths is None:
+            # Try UCF-Crime model first, fallback to binary model
+            ucf_model = os.path.join(current_dir, 'datasets/ucf_crime_yolo/ucf_crime_detector_best.pt')
+            if os.path.exists(ucf_model):
+                model_paths = [ucf_model]
+            else:
+                model_paths = [os.path.join(current_dir, 'datasets/violence/violence_detector_best.pt')]
+        
+        # Verify model files exist
+        for path in model_paths:
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Model file not found: {path}")
+          # Load YOLO model for violence detection
+        self.model = YOLO(model_paths[0])        # Determine class names based on model - UCF-Crime multi-class classification
+        try:
+            # Try to get class names from model
+            if hasattr(self.model, 'names'):
+                model_class_names = list(self.model.names.values())
+                print(f"Model has {len(model_class_names)} classes: {model_class_names}")
+                
+                # If model only has 2 classes, warn user about limited functionality
+                if len(model_class_names) == 2:
+                    print("⚠ WARNING: Model only has 2 classes (binary classification).")
+                    print("   For full UCF-Crime multiclass detection, you need a model trained with data_multiclass.yaml")
+                    print("   Currently detecting: non-violent vs violent")
+                    print("   System will intelligently map binary outputs to specific violence types")
+                    
+                # Store both model and desired class names
+                self.model_class_names = model_class_names
+                self.class_names = model_class_names  # This can be overridden later
+            else:
+                # UCF-Crime multi-class - expand to include specific violence types
+                self.class_names = ['non-violent', 'violent', 'abuse', 'arrest', 'arson', 'assault', 'burglary', 'explosion', 'fighting', 'robbery', 'shooting', 'shoplifting', 'stealing', 'vandalism']
+                self.model_class_names = self.class_names
+                print("Using default UCF-Crime multi-class labels")
+        except:
+            self.class_names = ['non-violent', 'violent']  # Fallback to binary
+            self.model_class_names = self.class_names
+            print("Fallback to binary classification")# UCF-Crime multi-class thresholds
+        self.class_thresholds = {
+            'non-violent': 0.6,
+            'violent': 0.3,
+            'abuse': 0.35,
+            'arrest': 0.4,
+            'arson': 0.3,
+            'assault': 0.35,
+            'burglary': 0.4,
+            'explosion': 0.25,  # Lower threshold for critical events
+            'fighting': 0.4,
+            'robbery': 0.35,
+            'shooting': 0.25,  # Lower threshold for critical violence
+            'shoplifting': 0.4,
+            'stealing': 0.4,
+            'vandalism': 0.35,
+            # Legacy fallbacks
+            'normal': 0.6,
+            'violence': 0.3
+        }
+        
+        # Initialize pose processor if enabled
+        self.enable_pose_validation = enable_pose_validation
+        if enable_pose_validation:
+            try:
+                pose_model_path = os.path.join(current_dir, 'yolov8x-pose.pt')
+                self.pose_processor = UCFCrimePoseProcessor(pose_model_path)
+                logger.info("UCF-Crime pose processor initialized")
+            except Exception as e:
+                logger.warning(f"Could not initialize pose processor: {e}")
+                self.pose_processor = None
+        else:
+            self.pose_processor = None
+        
+        # Temporal tracking
+        self.temporal_window = deque(maxlen=8)
+        self.min_pose_confidence = 0.4
+        
+        # Distance-based confidence adjustments
+        self.distance_confidence_adjustments = {
+            'near': 1.0,
+            'medium': 0.85,
+            'far': 0.7
+        }
+        
+        logger.info(f"UCFCrimeViolenceDetector initialized with classes: {self.class_names}")
+
+    def detect_violence(self, frame, conf_threshold=None):
+        """
+        Detect violence in frame with UCF-Crime multi-class support
+        
+        Args:
+            frame: Input frame
+            conf_threshold: Optional confidence threshold override
+            
+        Returns:
+            List of detections [x1, y1, x2, y2, confidence, class_id]
+        """
+        try:
+            if conf_threshold is None:
+                conf_threshold = 0.25  # Base threshold
+              # Run inference
+            results = self.model(frame, imgsz=1280, verbose=False)[0]
+            
+            detections = []
+            
+            if results.boxes is not None and len(results.boxes) > 0:
+                boxes = results.boxes.data.cpu().numpy()
+                
+                for box in boxes:
+                    x1, y1, x2, y2, conf, cls = box
+                    class_id = int(cls)
+                    
+                    # Skip 'non-violent' class detections (class_id = 0)
+                    if class_id == 0:
+                        continue
+                    
+                    # Get class name
+                    class_name = self.class_names[class_id] if class_id < len(self.class_names) else 'unknown'
+                    
+                    # Apply class-specific threshold
+                    threshold = self.class_thresholds.get(class_name, conf_threshold)
+                    
+                    if conf > threshold:
+                        # Validate with pose if enabled
+                        if self.pose_processor and self.enable_pose_validation:
+                            pose_validation = self._validate_with_pose(frame, [x1, y1, x2, y2], class_name)
+                            if not pose_validation['valid']:
+                                # Reduce confidence if pose validation fails
+                                conf *= 0.7
+                                if conf < threshold:
+                                    continue
+                        
+                        # Apply temporal consistency
+                        conf = self._apply_temporal_consistency(conf, class_id, [x1, y1, x2, y2])
+                        
+                        if conf > threshold:
+                            detections.append([
+                                int(x1), int(y1), int(x2), int(y2),
+                                float(conf),
+                                class_id
+                            ])
+            
+            # Store for temporal consistency
+            self.temporal_window.append(detections)
+            
+            return detections
+            
+        except Exception as e:
+            logger.error(f"Error in UCF-Crime violence detection: {str(e)}")
+            return []
+
+    def _validate_with_pose(self, frame, bbox, violence_type):
+        """Validate detection using pose analysis"""
+        if not self.pose_processor:
+            return {'valid': True, 'confidence': 0.5}
+            
+        try:
+            return self.pose_processor.validate_violence_with_pose(frame, bbox, violence_type)
+        except Exception as e:
+            logger.error(f"Error in pose validation: {str(e)}")
+            return {'valid': True, 'confidence': 0.5}
+
+    def _apply_temporal_consistency(self, confidence, class_id, bbox):
+        """Apply temporal consistency to reduce false positives"""
+        try:
+            if len(self.temporal_window) < 2:
+                return confidence
+            
+            # Check recent detections for similar class and location
+            recent_detections = []
+            for recent_frame in list(self.temporal_window)[-3:]:  # Last 3 frames
+                for det in recent_frame:
+                    det_class_id = int(det[5])
+                    if det_class_id == class_id:
+                        # Check location similarity
+                        det_bbox = det[:4]
+                        overlap = self._calculate_bbox_overlap(bbox, det_bbox)
+                        if overlap > 0.3:  # 30% overlap threshold
+                            recent_detections.append(det[4])  # Store confidence
+            
+            # Boost confidence if consistently detected
+            if len(recent_detections) >= 2:
+                avg_recent_conf = np.mean(recent_detections)
+                confidence = min(confidence * 1.2, max(confidence, avg_recent_conf * 1.1))
+            elif len(recent_detections) == 0:
+                # Reduce confidence for isolated detections
+                confidence *= 0.8
+                
+            return confidence
+            
+        except Exception as e:
+            logger.error(f"Error in temporal consistency: {str(e)}")
+            return confidence
+
+    def _calculate_bbox_overlap(self, bbox1, bbox2):
+        """Calculate overlap ratio between two bounding boxes"""
+        try:
+            x1_1, y1_1, x2_1, y2_1 = bbox1
+            x1_2, y1_2, x2_2, y2_2 = bbox2
+            
+            # Calculate intersection
+            ix1 = max(x1_1, x1_2)
+            iy1 = max(y1_1, y1_2)
+            ix2 = min(x2_1, x2_2)
+            iy2 = min(y2_1, y2_2)
+            
+            if ix2 <= ix1 or iy2 <= iy1:
+                return 0.0
+            
+            intersection = (ix2 - ix1) * (iy2 - iy1)
+            area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+            area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+            union = area1 + area2 - intersection
+            
+            return intersection / max(union, 1)
+            
+        except Exception as e:
+            return 0.0
+
+    def get_class_name(self, class_id):
+        """Get class name from class ID"""
+        if 0 <= class_id < len(self.class_names):
+            return self.class_names[class_id]
+        return 'unknown'
+
+    def is_violence_class(self, class_id):
+        """Check if class ID represents violence (not normal)"""
+        return class_id != 0  # All classes except 'normal' are violence

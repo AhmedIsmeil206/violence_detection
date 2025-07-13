@@ -80,7 +80,7 @@ def realtime_tracking(camera_source=0, model_path=None, reid_model_path=None, vi
         violence_type_model_path = os.path.join(os.path.dirname(__file__), "violence_models", "datasets", "type", "type_detector_best.pt")
     
     if ucf_crime_model_path is None:
-        ucf_crime_model_path = os.path.join(os.path.dirname(__file__), "violence_models", "datasets", "ucf_crime_yolo", "trained_models_960", "violence_detector_960", "weights", "best.pt")
+        ucf_crime_model_path = os.path.join(os.path.dirname(__file__), "violence_models", "datasets", "ucf_yolo_crime", "trained_models_speed_multiclass_640_b8", "ucf_crime_multiclass_640", "weights", "best.pt")
     
     if pose_model_path is None:
         pose_model_path = os.path.join(os.path.dirname(__file__), "yolov8x-pose.pt")
@@ -163,7 +163,10 @@ def realtime_tracking(camera_source=0, model_path=None, reid_model_path=None, vi
     # Initialize Violence Type Detector with the specified model path
     try:
         violence_type_detector = ViolenceTypeDetector(violence_type_model_path)
+        print(f"Violence Type Detector initialized successfully with classes: {violence_type_detector.class_names}")
+        print(f"Knife detection threshold: {violence_type_detector.class_thresholds.get(2, 'not found')}")
     except Exception as e:
+        print(f"Error initializing Violence Type Detector: {e}")
         violence_type_detector = None      # Class names from data.yaml files
     violence_class_names = ['normal', 'violence']    
     
@@ -173,12 +176,11 @@ def realtime_tracking(camera_source=0, model_path=None, reid_model_path=None, vi
                             'shoplifting', 'stealing', 'vandalism']
     print(f"Using full UCF-Crime classes: {ucf_crime_class_names}")
     
-    # Violence type class names (weapons/tools detection)
-    violence_type_class_names = ['knife', 'handgun', 'grenade', 'theft mask', 'normal']      # Initialize UCF-Crime Violence Detector if model path provided
+    # Violence type class names (weapons/tools detection) - MUST match the model's training data.yaml
+    violence_type_class_names = ['grenade', 'handgun', 'knife', 'theft mask']    # Initialize UCF-Crime Violence Detector if model path provided
     ucf_crime_detector = None
     if ucf_crime_model_path and os.path.exists(ucf_crime_model_path):
         try:
-            from violence_models.pose_estimation.ucf_crime_pose_processor import UCFCrimePoseProcessor
             ucf_crime_detector = UCFCrimeViolenceDetector(ucf_crime_model_path)
             # Override model class names with full UCF-Crime classes
             ucf_crime_detector.class_names = ucf_crime_class_names
@@ -192,8 +194,9 @@ def realtime_tracking(camera_source=0, model_path=None, reid_model_path=None, vi
     pose_processor = None
     if enable_pose_estimation and pose_model_path and os.path.exists(pose_model_path):
         try:
-            pose_processor = UCFCrimePoseProcessor()
-            print("UCF-Crime pose processor initialized successfully")
+            from violence_models.pose_estimation.pose_processor import PoseProcessor
+            pose_processor = PoseProcessor(pose_model_path)
+            print("Pose processor initialized successfully")
         except Exception as e:
             print(f"Error initializing pose processor: {e}")
             pose_processor = None
@@ -278,7 +281,15 @@ def realtime_tracking(camera_source=0, model_path=None, reid_model_path=None, vi
                   # Run violence type detection if available
                 if violence_type_detector is not None:
                     # Enhanced violence type detection with adaptive thresholds
-                    violence_type_results = violence_type_detector.detect_violence_type(frame, conf_threshold=0.3)
+                    violence_type_results = violence_type_detector.detect_violence_type(frame, conf_threshold=0.05)
+                    
+                    # Debug: Print what weapons are detected
+                    if len(violence_type_results) > 0:
+                        print(f"DEBUG: {len(violence_type_results)} weapon detections found:")
+                        for i, det in enumerate(violence_type_results):
+                            x1, y1, x2, y2, conf, class_id = det
+                            weapon_name = violence_type_class_names[class_id]
+                            print(f"  - {weapon_name}: confidence={conf:.3f}, bbox=[{x1:.0f},{y1:.0f},{x2:.0f},{y2:.0f}]")
                     
                     # Clear the current frame's detections but keep track of persistent weapons
                     current_detections = {}
@@ -294,9 +305,11 @@ def realtime_tracking(camera_source=0, model_path=None, reid_model_path=None, vi
                         if weapon_type == 'theft mask':
                             min_conf_required = 0.5  # Higher for masks (many false positives)
                         elif weapon_type == 'handgun':
-                            min_conf_required = 0.4  # Medium for handguns
-                        elif weapon_type in ['knife', 'grenade']:
-                            min_conf_required = 0.3  # Lower for distinctive objects
+                            min_conf_required = 0.3  # Medium for handguns
+                        elif weapon_type == 'knife':
+                            min_conf_required = 0.05  # Extremely low for knives - detect almost anything
+                        elif weapon_type == 'grenade':
+                            min_conf_required = 0.25  # Lower for distinctive objects
                         
                         # Skip if confidence too low
                         if conf < min_conf_required:
@@ -313,8 +326,8 @@ def realtime_tracking(camera_source=0, model_path=None, reid_model_path=None, vi
                         # Class-specific size validation
                         valid_size = True
                         if weapon_type == 'knife':
-                            # Knives should be elongated
-                            if aspect_ratio < 1.5 or area_ratio > 0.05:
+                            # Knives - extremely relaxed validation (almost no restrictions)
+                            if area_ratio > 0.25:  # Only filter truly massive objects
                                 valid_size = False
                         elif weapon_type == 'handgun':
                             # Handguns should have moderate aspect ratio
@@ -353,10 +366,28 @@ def realtime_tracking(camera_source=0, model_path=None, reid_model_path=None, vi
                             persistent_weapons[detection_id]['track_count'] += 1
                             persistent_weapons[detection_id]['frames_missing'] = 0
                             
-                            # DO NOT update the bbox at all after it's first detected
-                            # Keep it completely static like human detection boxes
-                            # Only update confidence if significantly higher
-                            if conf > persistent_weapons[detection_id]['confidence'] + 0.2:
+                            # UPDATE bbox dynamically like human tracking for flexibility
+                            # Use weighted average to smooth bbox updates
+                            old_bbox = persistent_weapons[detection_id]['bbox']
+                            weight = 0.7  # How much to keep from old bbox (0.7 = 70% old, 30% new)
+                            
+                            # Smooth bbox update
+                            smooth_x1 = old_bbox[0] * weight + x1 * (1 - weight)
+                            smooth_y1 = old_bbox[1] * weight + y1 * (1 - weight)
+                            smooth_x2 = old_bbox[2] * weight + x2 * (1 - weight)
+                            smooth_y2 = old_bbox[3] * weight + y2 * (1 - weight)
+                            
+                            persistent_weapons[detection_id]['bbox'] = [smooth_x1, smooth_y1, smooth_x2, smooth_y2]
+                            
+                            # Add to bbox history for tracking (keep last 5 positions)
+                            if 'bbox_history' not in persistent_weapons[detection_id]:
+                                persistent_weapons[detection_id]['bbox_history'] = []
+                            persistent_weapons[detection_id]['bbox_history'].append([x1, y1, x2, y2])
+                            if len(persistent_weapons[detection_id]['bbox_history']) > 5:
+                                persistent_weapons[detection_id]['bbox_history'].pop(0)
+                            
+                            # Update confidence if significantly higher
+                            if conf > persistent_weapons[detection_id]['confidence'] + 0.1:
                                 persistent_weapons[detection_id]['confidence'] = conf
                             
                             # Update stable counts immediately when detected
@@ -370,10 +401,10 @@ def realtime_tracking(camera_source=0, model_path=None, reid_model_path=None, vi
                             # This prevents multiple boxes for the same weapon
                             create_new = True
                             
-                            # Check if there's already a weapon of the same type nearby
+                            # Check if there's already a weapon of the same type nearby using current bbox
                             for existing_id, existing_weapon in persistent_weapons.items():
                                 if existing_weapon['class_id'] == class_id:  # Same type of weapon
-                                    ex1, ey1, ex2, ey2 = existing_weapon['bbox']
+                                    ex1, ey1, ex2, ey2 = existing_weapon['bbox']  # Use current flexible bbox
                                     # Calculate centers
                                     ex_center = ((ex1 + ex2) / 2, (ey1 + ey2) / 2)
                                     new_center = ((x1 + x2) / 2, (y1 + y2) / 2)
@@ -381,7 +412,14 @@ def realtime_tracking(camera_source=0, model_path=None, reid_model_path=None, vi
                                     distance = np.sqrt((new_center[0] - ex_center[0])**2 + 
                                                       (new_center[1] - ex_center[1])**2)
                                     if distance < 100:  # If within 100 pixels
-                                        # Update last_seen but don't create new detection
+                                        # Update the existing weapon's bbox to this new detection for flexibility
+                                        old_bbox = existing_weapon['bbox']
+                                        weight = 0.6  # Slightly more responsive for updates
+                                        smooth_x1 = old_bbox[0] * weight + x1 * (1 - weight)
+                                        smooth_y1 = old_bbox[1] * weight + y1 * (1 - weight)
+                                        smooth_x2 = old_bbox[2] * weight + x2 * (1 - weight)
+                                        smooth_y2 = old_bbox[3] * weight + y2 * (1 - weight)
+                                        existing_weapon['bbox'] = [smooth_x1, smooth_y1, smooth_x2, smooth_y2]
                                         existing_weapon['last_seen'] = current_time
                                         existing_weapon['frames_missing'] = 0
                                         create_new = False
@@ -389,7 +427,7 @@ def realtime_tracking(camera_source=0, model_path=None, reid_model_path=None, vi
                             
                             # Only create new weapon detection if not near an existing one
                             if create_new:
-                                # Create new weapon track
+                                # Create new weapon track with dynamic bbox capability
                                 persistent_weapons[detection_id] = {
                                     'bbox': [x1, y1, x2, y2],
                                     'type': violence_type_class_names[class_id],
@@ -399,7 +437,8 @@ def realtime_tracking(camera_source=0, model_path=None, reid_model_path=None, vi
                                     'track_count': 1,
                                     'frames_missing': 0,
                                     'counted': False,
-                                    'original_bbox': [x1, y1, x2, y2]  # Store original bbox 
+                                    'original_bbox': [x1, y1, x2, y2],  # Keep original for reference
+                                    'bbox_history': [[x1, y1, x2, y2]]  # Track bbox changes
                                 }
                         
                         # Store in current detections
@@ -508,14 +547,21 @@ def realtime_tracking(camera_source=0, model_path=None, reid_model_path=None, vi
                         for weapon_id, v_det in violence_type_detections.items():
                             v_box = v_det['bbox']
                             
-                            # Less strict weapon size limits
+                            # Less strict weapon size limits - especially for knives
                             weapon_width = v_box[2] - v_box[0]
                             weapon_height = v_box[3] - v_box[1]
-                            if weapon_width > w * 0.8 or weapon_height > h * 0.8:  # Only filter very large weapons
+                            # Only filter extremely large weapons, be very permissive for knives
+                            if v_det['type'] == 'knife':
+                                # Almost no size restriction for knives
+                                if weapon_width > w * 1.5 or weapon_height > h * 1.5:
+                                    continue
+                            elif weapon_width > w * 0.8 or weapon_height > h * 0.8:  # Only filter very large weapons
                                 continue
                             
-                            # Skip weapons with very low confidence
-                            if v_det['confidence'] < 0.25:  # Lower threshold to detect more weapons
+                            # Skip weapons with very low confidence - much more permissive for knives
+                            if v_det['type'] == 'knife' and v_det['confidence'] < 0.10:  # Very low threshold for knives
+                                continue
+                            elif v_det['confidence'] < 0.20:  # Lower threshold for other weapons
                                 continue
                             
                             # Check if weapon is within the expanded person area
@@ -752,15 +798,12 @@ def realtime_tracking(camera_source=0, model_path=None, reid_model_path=None, vi
                 cv2.putText(display_frame, label, (x1, y1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         
-        # Draw weapon detections with their own labels - only if they're recent enough
+        # Draw weapon detections with their own labels - using flexible bbox
         for weapon_id, v_det in violence_type_detections.items():
             # Only draw weapons that are currently visible or seen recently
             if current_time - v_det['last_seen'] <= weapon_persistence:
-                # Use the original bounding box coordinates for complete stability
-                if 'original_bbox' in v_det:
-                    wx1, wy1, wx2, wy2 = map(int, v_det['original_bbox'])
-                else:
-                    wx1, wy1, wx2, wy2 = map(int, v_det['bbox'])
+                # Use the current flexible bounding box coordinates instead of static original
+                wx1, wy1, wx2, wy2 = map(int, v_det['bbox'])
                 
                 weapon_type = v_det['type']
                 confidence = v_det['confidence']
@@ -776,7 +819,7 @@ def realtime_tracking(camera_source=0, model_path=None, reid_model_path=None, vi
                 else:  # theft mask
                     weapon_color = (255, 255, 0)  # Cyan for theft mask
                 
-                # Draw the weapon box - always use the original bbox for maximum stability
+                # Draw the weapon box using current flexible bbox
                 cv2.rectangle(display_frame, 
                              (wx1, wy1), 
                              (wx2, wy2), 

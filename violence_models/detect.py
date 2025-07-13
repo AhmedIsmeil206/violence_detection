@@ -4,12 +4,12 @@ import torch
 from ultralytics import YOLO
 import logging
 from deep_sort import nn_matching
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 from violence_models.pose_estimation.pose_processor import PoseProcessor
-from violence_models.pose_estimation.ucf_crime_pose_processor import UCFCrimePoseProcessor
 from collections import deque
 import os
 
@@ -228,7 +228,7 @@ class ViolenceTypeDetector:
         self.class_thresholds = {
             0: 0.65,  # grenade - significantly increased threshold to reduce false positives
             1: 0.30,  # handgun - medium threshold
-            2: 0.25,  # knife - lower threshold, can be small and hard to detect
+            2: 0.15,  # knife - much lower threshold to detect knives better
             3: 0.80   # theft mask - very high threshold to prevent false detections
         }
         
@@ -236,7 +236,7 @@ class ViolenceTypeDetector:
         self.size_constraints = {
             'grenade': {'min_area_ratio': 0.0001, 'max_area_ratio': 0.02, 'aspect_ratio_range': (0.7, 1.4)},
             'handgun': {'min_area_ratio': 0.0001, 'max_area_ratio': 0.08, 'aspect_ratio_range': (1.2, 3.5)},
-            'knife': {'min_area_ratio': 0.00005, 'max_area_ratio': 0.05, 'aspect_ratio_range': (2.0, 10.0)},
+            'knife': {'min_area_ratio': 0.00001, 'max_area_ratio': 0.15, 'aspect_ratio_range': (1.0, 15.0)},  # More relaxed for knife
             'theft mask': {'min_area_ratio': 0.0005, 'max_area_ratio': 0.15, 'aspect_ratio_range': (0.8, 1.3)}
         }
         
@@ -296,8 +296,8 @@ class ViolenceTypeDetector:
         class_multiplier = 1.0
         aspect_ratio = width / max(height, 1)
         
-        if class_name == 'knife' and 2.0 <= aspect_ratio <= 8.0:
-            class_multiplier = 1.15  # Good knife aspect ratio
+        if class_name == 'knife' and 1.0 <= aspect_ratio <= 15.0:  # More relaxed aspect ratio for knife
+            class_multiplier = 1.25  # Higher boost for knife detection
         elif class_name == 'handgun' and 1.2 <= aspect_ratio <= 3.0:
             class_multiplier = 1.2   # Good handgun aspect ratio
         elif class_name == 'grenade' and 0.8 <= aspect_ratio <= 1.3:
@@ -341,7 +341,7 @@ class ViolenceTypeDetector:
         
         # Find stable detections (appeared in multiple recent frames)
         stable_detections = []
-        min_appearances = 2  # Require at least 2 frames
+        min_appearances = 1  # Reduced to 1 for faster weapon detection
         
         for det_key, current_det in current_frame_detections.items():
             appearances = 1  # Current frame
@@ -359,7 +359,7 @@ class ViolenceTypeDetector:
                 detection = current_det['detection'].copy()
                 detection[4] = avg_confidence * 1.1  # Boost for stability
                 stable_detections.append(detection)
-            elif current_det['detection'][4] > 0.7:  # Very high confidence single detection
+            elif current_det['detection'][4] > 0.5:  # Lower threshold for single detection
                 stable_detections.append(current_det['detection'])
         
         return stable_detections
@@ -662,7 +662,7 @@ class UCFCrimeViolenceDetector:
         if enable_pose_validation:
             try:
                 pose_model_path = os.path.join(current_dir, 'yolov8x-pose.pt')
-                self.pose_processor = UCFCrimePoseProcessor(pose_model_path)
+                self.pose_processor = PoseProcessor(pose_model_path)
                 logger.info("UCF-Crime pose processor initialized")
             except Exception as e:
                 logger.warning(f"Could not initialize pose processor: {e}")
@@ -754,7 +754,17 @@ class UCFCrimeViolenceDetector:
             return {'valid': True, 'confidence': 0.5}
             
         try:
-            return self.pose_processor.validate_violence_with_pose(frame, bbox, violence_type)
+            # Use existing pose processing functionality
+            pose_results = self.pose_processor.process_frame(frame)
+            if pose_results:
+                # Simple validation based on motion score
+                max_motion = max([result.get('motion_score', 0) for result in pose_results])
+                # Consider it valid if there's significant motion for violent activities
+                is_valid = max_motion > 5.0 if violence_type in ['fighting', 'assault', 'shooting'] else True
+                confidence = min(max_motion / 20.0, 1.0)  # Normalize motion to confidence
+                return {'valid': is_valid, 'confidence': confidence}
+            else:
+                return {'valid': True, 'confidence': 0.5}
         except Exception as e:
             logger.error(f"Error in pose validation: {str(e)}")
             return {'valid': True, 'confidence': 0.5}
